@@ -1,16 +1,19 @@
 """
-Recherche de medicaments via Claude AI.
-Claude connait parfaitement la BDPM française - source fiable et stable.
+Recherche de medicaments via Claude AI (connaissance BDPM française).
 """
 import json
 import os
 import logging
+import re
 
 logger = logging.getLogger(__name__)
 
 
 def search_medicaments(query: str, limit: int = 5) -> list[dict]:
-    """Recherche un medicament via Claude AI (base BDPM integree)."""
+    """
+    Recherche un medicament via Claude AI.
+    Retourne une liste de medicaments BDPM reels.
+    """
     import anthropic
 
     api_key = os.environ.get("ANTHROPIC_API_KEY", "")
@@ -20,36 +23,72 @@ def search_medicaments(query: str, limit: int = 5) -> list[dict]:
 
     client = anthropic.Anthropic(api_key=api_key)
 
-    prompt = (
-        f'Donne-moi {limit} medicaments reels de la BDPM française pour : "{query}". '
-        'Reponds UNIQUEMENT avec un JSON array valide, sans texte ni backticks. '
-        'Format : [{"code_cis":"...","denomination":"...","forme_pharma":"...",'
-        '"voies_admin":"...","statut_amm":"Autorisation active",'
-        '"etat_commercialisation":"Commercialise","substance_active":"..."}]'
+    system_prompt = (
+        "Tu es un expert de la pharmacopee française. "
+        "Tu reponds TOUJOURS avec un JSON array valide uniquement. "
+        "Aucun texte avant ou apres le JSON. Jamais de backticks."
+    )
+
+    user_prompt = (
+        f'Medicament recherche: "{query}"\n\n'
+        f"Retourne exactement {limit} medicaments commercialises en France.\n"
+        "Format JSON STRICT :\n"
+        '[{"denomination":"NOM COMPLET","forme_pharma":"forme","voies_admin":"voie",'
+        '"substance_active":"DCI","statut_amm":"Autorisation active",'
+        '"etat_commercialisation":"Commercialise","code_cis":"XXXXXXXX"}]'
     )
 
     try:
+        logger.info(f"Recherche BDPM via Claude pour: {query}")
+
         msg = client.messages.create(
-            model="claude-opus-4-6",
-            max_tokens=800,
-            system=(
-                "Tu es un expert en pharmacologie française et connais parfaitement "
-                "la Base de Donnees Publique des Medicaments (BDPM). "
-                "Reponds UNIQUEMENT avec du JSON valide. Aucun texte avant ou apres."
-            ),
-            messages=[{"role": "user", "content": prompt}],
+            model="claude-sonnet-4-6",
+            max_tokens=1000,
+            system=system_prompt,
+            messages=[{"role": "user", "content": user_prompt}],
         )
-        text = msg.content[0].text.strip()
-        # Extraire le tableau JSON meme si Claude ajoute du texte
-        start = text.find("[")
-        end = text.rfind("]") + 1
-        if start >= 0 and end > start:
-            text = text[start:end]
-        results = json.loads(text)
-        if isinstance(results, list):
-            return results[:limit]
+
+        raw = msg.content[0].text.strip()
+        logger.info(f"Reponse Claude brute: {raw[:200]}")
+
+        # Extraction robuste du JSON
+        parsed = _extract_json(raw)
+        if parsed and len(parsed) > 0:
+            logger.info(f"Resultats trouves: {len(parsed)}")
+            return parsed[:limit]
+        else:
+            logger.warning(f"Aucun resultat JSON parse depuis: {raw[:200]}")
+            return []
+
     except Exception as e:
-        logger.error(f"Erreur recherche medicament: {e}")
+        logger.error(f"Erreur Claude search: {type(e).__name__}: {e}")
+        return []
+
+
+def _extract_json(text: str) -> list:
+    """Extrait le JSON array meme si du texte parasite est present."""
+    # Nettoyer les backticks
+    text = text.replace("```json", "").replace("```", "").strip()
+
+    # Trouver le tableau JSON
+    start = text.find("[")
+    end = text.rfind("]")
+    if start >= 0 and end > start:
+        candidate = text[start:end + 1]
+        try:
+            result = json.loads(candidate)
+            if isinstance(result, list):
+                return result
+        except json.JSONDecodeError as e:
+            logger.error(f"JSON decode error: {e} — texte: {candidate[:100]}")
+
+    # Essai direct
+    try:
+        result = json.loads(text)
+        if isinstance(result, list):
+            return result
+    except Exception:
+        pass
 
     return []
 
