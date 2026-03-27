@@ -1,29 +1,25 @@
 """
 API REST pour la generation d'ordonnances medicales PDF.
-Version 1.3 - recherche medicament robuste via Claude
+Version 1.4
 """
 import os
 import tempfile
 import logging
+import anthropic
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from typing import Optional
-import anthropic
 
-from app.bdpm import search_medicaments, get_medicament_detail
+from app.bdpm import search_medicaments
 from app.claude_ai import format_prescription_line, validate_prescription
 from app.pdf_generator import generate_pdf
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(
-    title="API Ordonnance Medicale",
-    description="Genere des ordonnances PDF via Claude AI + BDPM.",
-    version="1.3.0",
-)
+app = FastAPI(title="API Ordonnance", version="1.4.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -37,7 +33,7 @@ app.add_middleware(
 def get_claude_client():
     api_key = os.environ.get("ANTHROPIC_API_KEY")
     if not api_key:
-        raise HTTPException(status_code=500, detail="ANTHROPIC_API_KEY non configuree")
+        raise HTTPException(status_code=500, detail="ANTHROPIC_API_KEY manquante")
     return anthropic.Anthropic(api_key=api_key)
 
 
@@ -81,30 +77,87 @@ class ValidationRequest(BaseModel):
 
 @app.get("/", include_in_schema=False)
 def root():
-    return {"status": "ok", "version": "1.3.0", "docs": "/docs"}
+    return {"status": "ok", "version": "1.4.0"}
 
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "libreoffice": _check_libreoffice()}
+    import shutil
+    lo = any(shutil.which(c) for c in ["libreoffice", "soffice"])
+    return {"status": "ok", "libreoffice": lo}
+
+
+@app.get("/debug/claude", tags=["Debug"])
+def debug_claude():
+    """
+    Teste la connexion Claude directement.
+    Ouvrez /debug/claude dans votre navigateur pour diagnostiquer.
+    """
+    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+    if not api_key:
+        return {"error": "ANTHROPIC_API_KEY manquante dans Railway Variables"}
+
+    try:
+        client = anthropic.Anthropic(api_key=api_key)
+        msg = client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=200,
+            messages=[{"role": "user", "content": 'Reponds juste: ["ok"]'}],
+        )
+        raw = msg.content[0].text.strip()
+        return {
+            "status": "Claude repond",
+            "raw_response": raw,
+            "api_key_present": True,
+            "api_key_prefix": api_key[:12] + "...",
+        }
+    except anthropic.AuthenticationError:
+        return {"error": "Cle API invalide ou expiree", "solution": "Verifier ANTHROPIC_API_KEY dans Railway Variables"}
+    except Exception as e:
+        return {"error": str(e), "type": type(e).__name__}
+
+
+@app.get("/debug/search/{query}", tags=["Debug"])
+def debug_search(query: str):
+    """Teste la recherche medicament et affiche la reponse brute de Claude."""
+    import anthropic as anthr
+
+    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+    if not api_key:
+        return {"error": "ANTHROPIC_API_KEY manquante"}
+
+    try:
+        client = anthr.Anthropic(api_key=api_key)
+        user_prompt = (
+            f'Donne-moi 3 medicaments commercialises en France pour "{query}". '
+            'Reponds UNIQUEMENT avec un JSON array, rien d\'autre.'
+        )
+        msg = client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=800,
+            messages=[{"role": "user", "content": user_prompt}],
+        )
+        raw = msg.content[0].text.strip()
+        return {
+            "query": query,
+            "raw_claude_response": raw,
+            "response_length": len(raw),
+        }
+    except Exception as e:
+        return {"error": str(e), "type": type(e).__name__}
 
 
 @app.post("/api/bdpm/search", tags=["BDPM"])
 def bdpm_search(req: BDPMSearchRequest):
-    """
-    Recherche un medicament via Claude AI (base BDPM integree).
-    Retourne toujours une liste - jamais d'erreur 404.
-    """
-    logger.info(f"Recherche medicament: {req.query}")
+    """Recherche un medicament via Claude AI."""
+    logger.info(f"Recherche: {req.query}")
     results = search_medicaments(req.query, req.limit)
-    logger.info(f"Resultats: {len(results)} medicaments trouves")
-    # Retourner liste vide plutot que 404
+    logger.info(f"Resultats: {len(results)}")
     return {"query": req.query, "count": len(results), "results": results}
 
 
 @app.post("/api/prescription/format", tags=["Prescription"])
 def format_prescription(req: FormatPrescriptionRequest):
-    """Formate une ligne d'ordonnance avec Claude AI."""
     client = get_claude_client()
     ligne = format_prescription_line(
         client=client,
@@ -113,33 +166,25 @@ def format_prescription(req: FormatPrescriptionRequest):
         forme_pharma=req.forme_pharma,
         posologie_libre=req.posologie_libre,
     )
-    return {
-        "denomination": req.denomination,
-        "ligne": ligne,
-        "source": "libre" if req.posologie_libre else "claude_ai",
-    }
+    return {"denomination": req.denomination, "ligne": ligne,
+            "source": "libre" if req.posologie_libre else "claude_ai"}
 
 
 @app.post("/api/prescription/validate", tags=["Prescription"])
 def validate_prescriptions_route(req: ValidationRequest):
-    """Verifie les interactions medicamenteuses."""
     client = get_claude_client()
-    result = validate_prescription(
+    return validate_prescription(
         client=client,
-        prescriptions=[
-            {"denomination": p.denomination, "indication": p.indication}
-            for p in req.prescriptions
-        ],
+        prescriptions=[{"denomination": p.denomination, "indication": p.indication}
+                       for p in req.prescriptions],
         patient_age=req.patient_age,
         patient_weight=req.patient_weight,
         allergies=req.allergies,
     )
-    return result
 
 
 @app.post("/api/ordonnance/generate", tags=["Ordonnance"], response_class=FileResponse)
 def generate_ordonnance(req: OrdonnanceRequest, background_tasks: BackgroundTasks):
-    """Genere le PDF d'ordonnance non-modifiable."""
     output_dir = tempfile.mkdtemp()
     try:
         pdf_path = generate_pdf(
@@ -159,8 +204,8 @@ def generate_ordonnance(req: OrdonnanceRequest, background_tasks: BackgroundTask
     except RuntimeError as e:
         raise HTTPException(status_code=500, detail=str(e))
     except Exception as e:
-        logger.exception("Erreur generation PDF")
-        raise HTTPException(status_code=500, detail=f"Erreur: {e}")
+        logger.exception("Erreur PDF")
+        raise HTTPException(status_code=500, detail=str(e))
 
     background_tasks.add_task(_cleanup, output_dir)
     filename = os.path.basename(pdf_path)
@@ -170,11 +215,6 @@ def generate_ordonnance(req: OrdonnanceRequest, background_tasks: BackgroundTask
         filename=filename,
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
-
-
-def _check_libreoffice() -> bool:
-    import shutil
-    return any(shutil.which(cmd) for cmd in ["libreoffice", "soffice"])
 
 
 def _cleanup(path: str):
