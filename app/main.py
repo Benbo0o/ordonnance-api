@@ -1,19 +1,15 @@
 """
 API REST pour la generation d'ordonnances medicales PDF.
-Utilise Claude API + BDPM + python-docx + LibreOffice.
-
-Lancer : uvicorn app.main:app --reload --port 8000
-Documentation : http://localhost:8000/docs
 """
 import os
 import tempfile
+import logging
 from fastapi import FastAPI, HTTPException, BackgroundTasks
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from typing import Optional
 import anthropic
-import logging
 
 from app.bdpm import search_medicaments, get_medicament_detail
 from app.claude_ai import format_prescription_line, validate_prescription
@@ -24,12 +20,11 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI(
     title="API Ordonnance Medicale",
-    description="Genere des ordonnances PDF non-modifiables via Claude AI + BDPM.",
-    version="1.1.0",
-    contact={"name": "Dr. Benjamin BONNOT", "email": "drbonnot@gmail.com"},
+    description="Genere des ordonnances PDF via Claude AI + BDPM.",
+    version="1.2.0",
 )
 
-# CORS — autorise toutes les origines (iPhone, navigateur, apps)
+# CORS - autorise toutes les origines (iPhone, navigateur, etc.)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -39,39 +34,28 @@ app.add_middleware(
 )
 
 
-def get_claude_client() -> anthropic.Anthropic:
+def get_claude_client():
     api_key = os.environ.get("ANTHROPIC_API_KEY")
     if not api_key:
-        raise HTTPException(
-            status_code=500,
-            detail="ANTHROPIC_API_KEY non configuree dans les variables d'environnement"
-        )
+        raise HTTPException(status_code=500, detail="ANTHROPIC_API_KEY non configuree")
     return anthropic.Anthropic(api_key=api_key)
 
 
 class BDPMSearchRequest(BaseModel):
-    query: str = Field(..., description="Nom commercial ou DCI du medicament", example="doliprane")
-    limit: int = Field(5, ge=1, le=20, description="Nombre de resultats")
+    query: str = Field(..., example="doliprane")
+    limit: int = Field(5, ge=1, le=10)
 
 
 class FormatPrescriptionRequest(BaseModel):
     denomination: str = Field(..., example="DOLIPRANE 1000mg comprime")
     indication: str = Field(..., example="Douleur post-operatoire")
     forme_pharma: str = Field("", example="comprime")
-    posologie_libre: Optional[str] = Field(
-        None,
-        description="Si renseigne, Claude n'est pas utilise",
-        example="1 comprime matin et soir pendant 5 jours"
-    )
+    posologie_libre: Optional[str] = Field(None)
 
 
 class MedicamentPrescrit(BaseModel):
-    denomination: str = Field(..., example="DOLIPRANE 1000mg comprime")
-    ligne: str = Field(
-        ...,
-        description="Ligne complete formatee",
-        example="DOLIPRANE 1000mg comprime\n    1 comprime x 3/j pendant 5 jours"
-    )
+    denomination: str
+    ligne: str
 
 
 class OrdonnanceRequest(BaseModel):
@@ -90,42 +74,32 @@ class OrdonnanceRequest(BaseModel):
 
 class ValidationRequest(BaseModel):
     prescriptions: list[FormatPrescriptionRequest]
-    patient_age: Optional[int] = Field(None, example=65)
-    patient_weight: Optional[float] = Field(None, example=75.0)
-    allergies: Optional[list[str]] = Field(None, example=["penicilline", "AINS"])
+    patient_age: Optional[int] = None
+    patient_weight: Optional[float] = None
+    allergies: Optional[list[str]] = None
 
 
 @app.get("/", include_in_schema=False)
 def root():
-    return {"message": "API Ordonnance Medicale v1.1", "docs": "/docs", "status": "ok"}
+    return {"status": "ok", "version": "1.2.0", "docs": "/docs"}
 
 
 @app.get("/health")
 def health():
-    """Verifie l'etat de l'API."""
     return {"status": "ok", "libreoffice": _check_libreoffice()}
 
 
-@app.post("/api/bdpm/search", summary="Rechercher un medicament dans la BDPM", tags=["BDPM"])
+@app.post("/api/bdpm/search", tags=["BDPM"])
 def bdpm_search(req: BDPMSearchRequest):
-    """Recherche dans la Base de Donnees Publique des Medicaments."""
+    """Recherche un medicament (via Claude AI - base BDPM integree)."""
     results = search_medicaments(req.query, req.limit)
-    if not results:
-        raise HTTPException(status_code=404, detail=f"Aucun medicament trouve pour '{req.query}'")
+    # Retourner liste vide plutot que 404 - le frontend gere l'absence de resultats
     return {"query": req.query, "count": len(results), "results": results}
 
 
-@app.get("/api/bdpm/medicament/{code_cis}", summary="Detail d'un medicament", tags=["BDPM"])
-def bdpm_detail(code_cis: str):
-    detail = get_medicament_detail(code_cis)
-    if not detail:
-        raise HTTPException(status_code=404, detail=f"Medicament {code_cis} non trouve")
-    return detail
-
-
-@app.post("/api/prescription/format", summary="Formater une ligne d'ordonnance", tags=["Prescription"])
+@app.post("/api/prescription/format", tags=["Prescription"])
 def format_prescription(req: FormatPrescriptionRequest):
-    """Utilise Claude pour rediger une ligne d'ordonnance professionnelle."""
+    """Formate une ligne d'ordonnance avec Claude AI."""
     client = get_claude_client()
     ligne = format_prescription_line(
         client=client,
@@ -141,17 +115,14 @@ def format_prescription(req: FormatPrescriptionRequest):
     }
 
 
-@app.post("/api/prescription/validate", summary="Verifier les interactions", tags=["Prescription"])
+@app.post("/api/prescription/validate", tags=["Prescription"])
 def validate_prescriptions(req: ValidationRequest):
-    """Analyse les interactions medicamenteuses."""
+    """Verifie les interactions medicamenteuses."""
     client = get_claude_client()
-    prescriptions_dict = [
-        {"denomination": p.denomination, "indication": p.indication}
-        for p in req.prescriptions
-    ]
     result = validate_prescription(
         client=client,
-        prescriptions=prescriptions_dict,
+        prescriptions=[{"denomination": p.denomination, "indication": p.indication}
+                       for p in req.prescriptions],
         patient_age=req.patient_age,
         patient_weight=req.patient_weight,
         allergies=req.allergies,
@@ -159,14 +130,9 @@ def validate_prescriptions(req: ValidationRequest):
     return result
 
 
-@app.post(
-    "/api/ordonnance/generate",
-    summary="Generer l'ordonnance PDF",
-    tags=["Ordonnance"],
-    response_class=FileResponse,
-)
+@app.post("/api/ordonnance/generate", tags=["Ordonnance"], response_class=FileResponse)
 def generate_ordonnance(req: OrdonnanceRequest, background_tasks: BackgroundTasks):
-    """Genere un PDF d'ordonnance non-modifiable."""
+    """Genere le PDF d'ordonnance non-modifiable."""
     output_dir = tempfile.mkdtemp()
     try:
         pdf_path = generate_pdf(
@@ -187,7 +153,7 @@ def generate_ordonnance(req: OrdonnanceRequest, background_tasks: BackgroundTask
         raise HTTPException(status_code=500, detail=str(e))
     except Exception as e:
         logger.exception("Erreur generation PDF")
-        raise HTTPException(status_code=500, detail=f"Erreur interne : {e}")
+        raise HTTPException(status_code=500, detail=f"Erreur: {e}")
 
     background_tasks.add_task(_cleanup, output_dir)
     filename = os.path.basename(pdf_path)
