@@ -1,5 +1,6 @@
 """
 API REST pour la generation d'ordonnances medicales PDF.
+Version 1.3 - recherche medicament robuste via Claude
 """
 import os
 import tempfile
@@ -21,10 +22,9 @@ logger = logging.getLogger(__name__)
 app = FastAPI(
     title="API Ordonnance Medicale",
     description="Genere des ordonnances PDF via Claude AI + BDPM.",
-    version="1.2.0",
+    version="1.3.0",
 )
 
-# CORS - autorise toutes les origines (iPhone, navigateur, etc.)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -47,10 +47,10 @@ class BDPMSearchRequest(BaseModel):
 
 
 class FormatPrescriptionRequest(BaseModel):
-    denomination: str = Field(..., example="DOLIPRANE 1000mg comprime")
-    indication: str = Field(..., example="Douleur post-operatoire")
-    forme_pharma: str = Field("", example="comprime")
-    posologie_libre: Optional[str] = Field(None)
+    denomination: str
+    indication: str
+    forme_pharma: str = ""
+    posologie_libre: Optional[str] = None
 
 
 class MedicamentPrescrit(BaseModel):
@@ -59,17 +59,17 @@ class MedicamentPrescrit(BaseModel):
 
 
 class OrdonnanceRequest(BaseModel):
-    patient_name: str = Field(..., example="MARTIN Sophie")
-    patient_dob: str = Field(..., example="15/03/1978")
+    patient_name: str
+    patient_dob: str
     prescriptions: list[MedicamentPrescrit] = Field(..., min_length=1)
-    doctor_name: str = Field("Benjamin BONNOT")
-    doctor_specialty: str = Field("Anesthesiste-Reanimateur")
-    doctor_rpps: str = Field("751031329")
-    clinic_name: str = Field("Clinique Moussins-Nollet")
-    clinic_address: str = Field("67 rue de Romainville, 75019 PARIS")
-    clinic_phone: str = Field("01 40 03 12 12")
-    clinic_finess: str = Field("750301160")
-    clinic_rpps_code: str = Field("10100661908")
+    doctor_name: str = "Benjamin BONNOT"
+    doctor_specialty: str = "Anesthesiste-Reanimateur"
+    doctor_rpps: str = "751031329"
+    clinic_name: str = "Clinique Moussins-Nollet"
+    clinic_address: str = "67 rue de Romainville, 75019 PARIS"
+    clinic_phone: str = "01 40 03 12 12"
+    clinic_finess: str = "750301160"
+    clinic_rpps_code: str = "10100661908"
 
 
 class ValidationRequest(BaseModel):
@@ -81,7 +81,7 @@ class ValidationRequest(BaseModel):
 
 @app.get("/", include_in_schema=False)
 def root():
-    return {"status": "ok", "version": "1.2.0", "docs": "/docs"}
+    return {"status": "ok", "version": "1.3.0", "docs": "/docs"}
 
 
 @app.get("/health")
@@ -91,9 +91,14 @@ def health():
 
 @app.post("/api/bdpm/search", tags=["BDPM"])
 def bdpm_search(req: BDPMSearchRequest):
-    """Recherche un medicament (via Claude AI - base BDPM integree)."""
+    """
+    Recherche un medicament via Claude AI (base BDPM integree).
+    Retourne toujours une liste - jamais d'erreur 404.
+    """
+    logger.info(f"Recherche medicament: {req.query}")
     results = search_medicaments(req.query, req.limit)
-    # Retourner liste vide plutot que 404 - le frontend gere l'absence de resultats
+    logger.info(f"Resultats: {len(results)} medicaments trouves")
+    # Retourner liste vide plutot que 404
     return {"query": req.query, "count": len(results), "results": results}
 
 
@@ -116,13 +121,15 @@ def format_prescription(req: FormatPrescriptionRequest):
 
 
 @app.post("/api/prescription/validate", tags=["Prescription"])
-def validate_prescriptions(req: ValidationRequest):
+def validate_prescriptions_route(req: ValidationRequest):
     """Verifie les interactions medicamenteuses."""
     client = get_claude_client()
     result = validate_prescription(
         client=client,
-        prescriptions=[{"denomination": p.denomination, "indication": p.indication}
-                       for p in req.prescriptions],
+        prescriptions=[
+            {"denomination": p.denomination, "indication": p.indication}
+            for p in req.prescriptions
+        ],
         patient_age=req.patient_age,
         patient_weight=req.patient_weight,
         allergies=req.allergies,
