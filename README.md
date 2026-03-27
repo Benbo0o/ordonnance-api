@@ -1,237 +1,212 @@
-# API Ordonnance Médicale
+"""
+API REST pour la generation d'ordonnances medicales PDF.
+Utilise Claude API + BDPM + python-docx + LibreOffice.
 
-Génère des ordonnances PDF non-modifiables via Claude API + BDPM.
+Lancer : uvicorn app.main:app --reload --port 8000
+Documentation : http://localhost:8000/docs
+"""
+import os
+import tempfile
+from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi.responses import FileResponse, JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
+from typing import Optional
+import anthropic
+import logging
 
-## Architecture
+from app.bdpm import search_medicaments, get_medicament_detail
+from app.claude_ai import format_prescription_line, validate_prescription
+from app.pdf_generator import generate_pdf
 
-```
-Client (votre app)
-    │
-    ▼
-FastAPI (port 8000)
-    ├── POST /api/bdpm/search          → Recherche BDPM officielle
-    ├── POST /api/prescription/format  → Formatage Claude AI
-    ├── POST /api/prescription/validate → Vérification interactions
-    └── POST /api/ordonnance/generate  → PDF non-modifiable ⬇
-            │
-            ├── python-docx  → Remplit le template Word
-            └── LibreOffice  → Convertit en PDF verrouillé
-```
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-## Installation
-
-### Prérequis
-
-```bash
-# Python 3.11+
-pip install -r requirements.txt
-
-# LibreOffice (conversion PDF)
-# macOS
-brew install --cask libreoffice
-
-# Ubuntu / Debian
-sudo apt install libreoffice
-
-# Windows : https://www.libreoffice.org/download/
-```
-
-### Logo clinique
-
-Copiez votre logo dans `template/logo_clinique.jpg`
-(sinon l'en-tête s'affiche sans logo)
-
-### Clé API Anthropic
-
-```bash
-export ANTHROPIC_API_KEY="sk-ant-api03-..."
-```
-
-## Lancer l'API
-
-```bash
-# Développement
-uvicorn app.main:app --reload --port 8000
-
-# Production
-uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 4
-```
-
-Documentation interactive : **http://localhost:8000/docs**
-
-## Utilisation
-
-### Option 1 — Script direct (le plus simple)
-
-```bash
-export ANTHROPIC_API_KEY="sk-ant-..."
-python scripts/generate_direct.py
-```
-
-### Option 2 — Via l'API REST
-
-#### Étape 1 : Chercher le médicament dans la BDPM
-
-```bash
-curl -X POST http://localhost:8000/api/bdpm/search \
-  -H "Content-Type: application/json" \
-  -d '{"query": "doliprane", "limit": 3}'
-```
-
-```json
-{
-  "query": "doliprane",
-  "count": 3,
-  "results": [
-    {
-      "code_cis": "60001393",
-      "denomination": "DOLIPRANE 1000 mg, comprimé",
-      "forme_pharma": "comprimé",
-      "voies_admin": "orale",
-      "statut_amm": "Autorisation active",
-      "etat_commercialisation": "Commercialisé"
-    }
-  ]
-}
-```
-
-#### Étape 2 : Formater la ligne d'ordonnance
-
-```bash
-curl -X POST http://localhost:8000/api/prescription/format \
-  -H "Content-Type: application/json" \
-  -d '{
-    "denomination": "DOLIPRANE 1000 mg, comprimé",
-    "indication": "Douleur post-opératoire",
-    "forme_pharma": "comprimé"
-  }'
-```
-
-```json
-{
-  "denomination": "DOLIPRANE 1000 mg, comprimé",
-  "ligne": "DOLIPRANE 1000 mg, comprimé\n    1 comprimé toutes les 6 heures si douleur (max 4/jour)\n    Durée : 5 jours",
-  "source": "claude_ai"
-}
-```
-
-#### Étape 3 : Générer le PDF
-
-```bash
-curl -X POST http://localhost:8000/api/ordonnance/generate \
-  -H "Content-Type: application/json" \
-  -o ordonnance_martin.pdf \
-  -d '{
-    "patient_name": "MARTIN Sophie",
-    "patient_dob": "15/03/1978",
-    "prescriptions": [
-      {
-        "denomination": "DOLIPRANE 1000 mg, comprimé",
-        "ligne": "DOLIPRANE 1000 mg, comprimé\n    1 comprimé toutes les 6h (max 4/j)\n    Durée : 5 jours"
-      },
-      {
-        "denomination": "IBUPROFENE 400 mg, comprimé",
-        "ligne": "IBUPROFENE 400 mg, comprimé\n    1 comprimé × 3/j au cours des repas\n    Durée : 5 jours"
-      }
-    ]
-  }'
-```
-
-### Option 3 — Docker
-
-```bash
-# Construire et lancer
-ANTHROPIC_API_KEY="sk-ant-..." docker-compose up -d
-
-# Vérifier
-curl http://localhost:8000/health
-```
-
-## Python — Intégration directe
-
-```python
-import requests
-
-BASE = "http://localhost:8000"
-
-def generer_ordonnance(patient_name, patient_dob, medicaments):
-    """
-    medicaments = [
-        {"query": "doliprane 1000", "indication": "douleur post-op"},
-        {"query": "ibuprofene 400", "indication": "anti-inflammatoire"},
-    ]
-    """
-    prescriptions = []
-
-    for med in medicaments:
-        # 1. BDPM
-        r = requests.post(f"{BASE}/api/bdpm/search",
-                          json={"query": med["query"], "limit": 1})
-        results = r.json().get("results", [])
-        denomination = results[0]["denomination"] if results else med["query"]
-
-        # 2. Formatage Claude
-        r = requests.post(f"{BASE}/api/prescription/format", json={
-            "denomination": denomination,
-            "indication": med["indication"],
-        })
-        ligne = r.json()["ligne"]
-        prescriptions.append({"denomination": denomination, "ligne": ligne})
-
-    # 3. PDF
-    r = requests.post(f"{BASE}/api/ordonnance/generate", json={
-        "patient_name": patient_name,
-        "patient_dob": patient_dob,
-        "prescriptions": prescriptions,
-    }, stream=True)
-
-    if r.status_code == 200:
-        with open("ordonnance.pdf", "wb") as f:
-            f.write(r.content)
-        print("✓ ordonnance.pdf générée")
-    else:
-        print(f"Erreur : {r.json()}")
-
-# Utilisation
-generer_ordonnance(
-    patient_name="MARTIN Sophie",
-    patient_dob="15/03/1978",
-    medicaments=[
-        {"query": "doliprane 1000", "indication": "douleur post-opératoire"},
-        {"query": "ibuprofene 400", "indication": "inflammation"},
-    ]
+app = FastAPI(
+    title="API Ordonnance Medicale",
+    description="Genere des ordonnances PDF non-modifiables via Claude AI + BDPM.",
+    version="1.1.0",
+    contact={"name": "Dr. Benjamin BONNOT", "email": "drbonnot@gmail.com"},
 )
-```
 
-## Structure du projet
+# CORS — autorise toutes les origines (iPhone, navigateur, apps)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-```
-ordonnance-api/
-├── app/
-│   ├── main.py            ← FastAPI — routes et modèles
-│   ├── bdpm.py            ← Intégration API BDPM
-│   ├── claude_ai.py       ← Formatage et validation via Claude
-│   └── pdf_generator.py   ← Génération Word → PDF
-├── template/
-│   └── logo_clinique.jpg  ← Votre logo (à ajouter)
-├── tests/
-│   └── test_api.py        ← Tests et exemples
-├── scripts/
-│   └── generate_direct.py ← Script standalone sans API
-├── requirements.txt
-├── Dockerfile
-├── docker-compose.yml
-└── README.md
-```
 
-## Variables d'environnement
+def get_claude_client() -> anthropic.Anthropic:
+    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    if not api_key:
+        raise HTTPException(
+            status_code=500,
+            detail="ANTHROPIC_API_KEY non configuree dans les variables d'environnement"
+        )
+    return anthropic.Anthropic(api_key=api_key)
 
-| Variable | Obligatoire | Description |
-|----------|-------------|-------------|
-| `ANTHROPIC_API_KEY` | ✓ | Clé API Anthropic (claude.ai → API Keys) |
 
-## Personnalisation
+class BDPMSearchRequest(BaseModel):
+    query: str = Field(..., description="Nom commercial ou DCI du medicament", example="doliprane")
+    limit: int = Field(5, ge=1, le=20, description="Nombre de resultats")
 
-Pour utiliser votre propre entête (autre clinique, autre médecin) :
-passez les paramètres `doctor_*` et `clinic_*` dans le body de `/api/ordonnance/generate`.
-Tous ont des valeurs par défaut configurées pour le Dr BONNOT.
+
+class FormatPrescriptionRequest(BaseModel):
+    denomination: str = Field(..., example="DOLIPRANE 1000mg comprime")
+    indication: str = Field(..., example="Douleur post-operatoire")
+    forme_pharma: str = Field("", example="comprime")
+    posologie_libre: Optional[str] = Field(
+        None,
+        description="Si renseigne, Claude n'est pas utilise",
+        example="1 comprime matin et soir pendant 5 jours"
+    )
+
+
+class MedicamentPrescrit(BaseModel):
+    denomination: str = Field(..., example="DOLIPRANE 1000mg comprime")
+    ligne: str = Field(
+        ...,
+        description="Ligne complete formatee",
+        example="DOLIPRANE 1000mg comprime\n    1 comprime x 3/j pendant 5 jours"
+    )
+
+
+class OrdonnanceRequest(BaseModel):
+    patient_name: str = Field(..., example="MARTIN Sophie")
+    patient_dob: str = Field(..., example="15/03/1978")
+    prescriptions: list[MedicamentPrescrit] = Field(..., min_length=1)
+    doctor_name: str = Field("Benjamin BONNOT")
+    doctor_specialty: str = Field("Anesthesiste-Reanimateur")
+    doctor_rpps: str = Field("751031329")
+    clinic_name: str = Field("Clinique Moussins-Nollet")
+    clinic_address: str = Field("67 rue de Romainville, 75019 PARIS")
+    clinic_phone: str = Field("01 40 03 12 12")
+    clinic_finess: str = Field("750301160")
+    clinic_rpps_code: str = Field("10100661908")
+
+
+class ValidationRequest(BaseModel):
+    prescriptions: list[FormatPrescriptionRequest]
+    patient_age: Optional[int] = Field(None, example=65)
+    patient_weight: Optional[float] = Field(None, example=75.0)
+    allergies: Optional[list[str]] = Field(None, example=["penicilline", "AINS"])
+
+
+@app.get("/", include_in_schema=False)
+def root():
+    return {"message": "API Ordonnance Medicale v1.1", "docs": "/docs", "status": "ok"}
+
+
+@app.get("/health")
+def health():
+    """Verifie l'etat de l'API."""
+    return {"status": "ok", "libreoffice": _check_libreoffice()}
+
+
+@app.post("/api/bdpm/search", summary="Rechercher un medicament dans la BDPM", tags=["BDPM"])
+def bdpm_search(req: BDPMSearchRequest):
+    """Recherche dans la Base de Donnees Publique des Medicaments."""
+    results = search_medicaments(req.query, req.limit)
+    if not results:
+        raise HTTPException(status_code=404, detail=f"Aucun medicament trouve pour '{req.query}'")
+    return {"query": req.query, "count": len(results), "results": results}
+
+
+@app.get("/api/bdpm/medicament/{code_cis}", summary="Detail d'un medicament", tags=["BDPM"])
+def bdpm_detail(code_cis: str):
+    detail = get_medicament_detail(code_cis)
+    if not detail:
+        raise HTTPException(status_code=404, detail=f"Medicament {code_cis} non trouve")
+    return detail
+
+
+@app.post("/api/prescription/format", summary="Formater une ligne d'ordonnance", tags=["Prescription"])
+def format_prescription(req: FormatPrescriptionRequest):
+    """Utilise Claude pour rediger une ligne d'ordonnance professionnelle."""
+    client = get_claude_client()
+    ligne = format_prescription_line(
+        client=client,
+        denomination=req.denomination,
+        indication=req.indication,
+        forme_pharma=req.forme_pharma,
+        posologie_libre=req.posologie_libre,
+    )
+    return {
+        "denomination": req.denomination,
+        "ligne": ligne,
+        "source": "libre" if req.posologie_libre else "claude_ai",
+    }
+
+
+@app.post("/api/prescription/validate", summary="Verifier les interactions", tags=["Prescription"])
+def validate_prescriptions(req: ValidationRequest):
+    """Analyse les interactions medicamenteuses."""
+    client = get_claude_client()
+    prescriptions_dict = [
+        {"denomination": p.denomination, "indication": p.indication}
+        for p in req.prescriptions
+    ]
+    result = validate_prescription(
+        client=client,
+        prescriptions=prescriptions_dict,
+        patient_age=req.patient_age,
+        patient_weight=req.patient_weight,
+        allergies=req.allergies,
+    )
+    return result
+
+
+@app.post(
+    "/api/ordonnance/generate",
+    summary="Generer l'ordonnance PDF",
+    tags=["Ordonnance"],
+    response_class=FileResponse,
+)
+def generate_ordonnance(req: OrdonnanceRequest, background_tasks: BackgroundTasks):
+    """Genere un PDF d'ordonnance non-modifiable."""
+    output_dir = tempfile.mkdtemp()
+    try:
+        pdf_path = generate_pdf(
+            patient_name=req.patient_name,
+            patient_dob=req.patient_dob,
+            prescriptions=[p.model_dump() for p in req.prescriptions],
+            output_dir=output_dir,
+            doctor_name=req.doctor_name,
+            doctor_specialty=req.doctor_specialty,
+            doctor_rpps=req.doctor_rpps,
+            clinic_name=req.clinic_name,
+            clinic_address=req.clinic_address,
+            clinic_phone=req.clinic_phone,
+            clinic_finess=req.clinic_finess,
+            clinic_rpps_code=req.clinic_rpps_code,
+        )
+    except RuntimeError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    except Exception as e:
+        logger.exception("Erreur generation PDF")
+        raise HTTPException(status_code=500, detail=f"Erreur interne : {e}")
+
+    background_tasks.add_task(_cleanup, output_dir)
+    filename = os.path.basename(pdf_path)
+    return FileResponse(
+        path=pdf_path,
+        media_type="application/pdf",
+        filename=filename,
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+def _check_libreoffice() -> bool:
+    import shutil
+    return any(shutil.which(cmd) for cmd in ["libreoffice", "soffice"])
+            
+
+def _cleanup(path: str):
+    import shutil
+    try:
+        shutil.rmtree(path, ignore_errors=True)
+    except Exception:
+        pass
