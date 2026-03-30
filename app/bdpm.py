@@ -4,7 +4,7 @@ import logging
 
 logger = logging.getLogger(**name**)
 
-def search_medicaments(query: str, limit: int = 5) -> list[dict]:
+def search_medicaments(query, limit=5):
 import anthropic
 api_key = os.environ.get(“ANTHROPIC_API_KEY”, “”)
 if not api_key:
@@ -16,10 +16,10 @@ model=“claude-sonnet-4-6”,
 max_tokens=1500,
 system=“Tu es expert en pharmacologie francaise. Reponds UNIQUEMENT avec un JSON array valide, sans backticks ni texte.”,
 messages=[{“role”: “user”, “content”: (
-f’Donne {limit} medicaments BDPM pour “{query}”. ’
-‘Format: [{“denomination”:“NOM”,“forme_pharma”:“forme”,“voies_admin”:“orale”,’
-‘“substance_active”:“DCI”,“statut_amm”:“Autorisation active”,’
-‘“etat_commercialisation”:“Commercialise”,“code_cis”:“12345678”}]’
+“Donne “ + str(limit) + “ medicaments BDPM pour “ + repr(query) + “. “
+“Format: [{“denomination”:“NOM”,“forme_pharma”:“forme”,“voies_admin”:“orale”,”
+““substance_active”:“DCI”,“statut_amm”:“Autorisation active”,”
+““etat_commercialisation”:“Commercialise”,“code_cis”:“12345678”}]”
 )}],
 )
 raw = msg.content[0].text.strip()
@@ -41,8 +41,8 @@ result.append({“denomination”: item, “forme_pharma”: “”,
 “code_cis”: “”})
 return result[:limit]
 except Exception as e:
-logger.error(f”Erreur: {e}”)
+logger.error(“Erreur: “ + str(e))
 return []
 
-def get_medicament_detail(code_cis: str):
+def get_medicament_detail(code_cis):
 return None
