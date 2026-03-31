@@ -26,7 +26,7 @@ user_msg = (’Medicament: ’ + str(query) + ’. ’
 ‘"voies_admin": "orale", ’
 ‘"substance_active": "Paracetamol", ’
 ‘"statut_amm": "Autorisation active", ’
-‘"etat_commercialisation": "Commercialise”, ’
+‘"etat_commercialisation": "Commercialise", ’
 ‘"code_cis”: "60001393"}]’)
 msg = client.messages.create(
 model=‘claude-sonnet-4-6’,
