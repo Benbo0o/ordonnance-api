@@ -27,7 +27,7 @@ user_msg = (’Medicament: ’ + str(query) + ’. ’
 ‘"substance_active": "Paracetamol", ’
 ‘"statut_amm": "Autorisation active", ’
 ‘"etat_commercialisation": "Commercialise", ’
-‘"code_cis”: "60001393"}]’)
+‘"code_cis": "60001393"}]’)
 msg = client.messages.create(
 model=‘claude-sonnet-4-6’,
 max_tokens=2000,
